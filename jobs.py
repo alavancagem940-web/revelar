@@ -22,8 +22,8 @@ from export_ios import (
 from photo_engine import enhance_photo, is_photo, is_video, load_image
 from video_engine import enhance_and_export_video, enhance_frame, first_frame
 
-# Força profissional interna — sem slider na UI.
-AUTO_INTENSITY = 0.72
+# Fotos: punch integral. Vídeo ainda usa este valor nos filtros leves.
+AUTO_INTENSITY = 1.0
 
 
 @dataclass

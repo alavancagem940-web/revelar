@@ -7,7 +7,7 @@ Revelar não é o TrilhaPy nem o Inglês Real. Não pede login, não usa nuvem e
 ## O que ele faz
 
 - Abre **JPG, PNG, HEIC** e **MP4 / MOV** (um ou vários arquivos, com fila visível).
-- Fotos: exposição automática, contraste adaptativo (CLAHE), balanço de branco, nitidez (unsharp mask) e redução de ruído (OpenCV + Pillow).
+- Fotos (resolução nativa): CLAHE no L do LAB (clip baixo, sem posterizar), unsharp de **alta frequência**, pretos/brancos automáticos por percentil (sombra preservada) e curva S para tirar o cinza lavado. JPEG q≈94 / PNG com sRGB.
 - Vídeos: equalização de cor, estabilização leve e otimização de bitrate, num **único passe** de exportação.
 - **100% automático:** sem slider de intensidade, sem barras de exposição, sem toque em “Aplicar”. Ao abrir um arquivo (ou as amostras), o pipeline profissional já corre em `threading.Thread`.
 - A janela mostra **antes/depois**, progresso/status e a **pasta de saída**. Dá para enfileirar outro arquivo, cancelar o job e mudar o preview enquanto processa.
