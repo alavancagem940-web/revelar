@@ -217,6 +217,42 @@ def _s_curve_l(l_ch: np.ndarray, amount: float = 0.16) -> np.ndarray:
     return (y * 255.0).astype(np.uint8)
 
 
+def _structure_mask(gray: np.ndarray) -> np.ndarray:
+    """0 = pele/fundo lisos, 1 = cabelo, tecido, bordas."""
+    g = gray.astype(np.float32)
+    blur = cv2.GaussianBlur(g, (0, 0), 1.4)
+    local = np.sqrt(np.maximum(cv2.GaussianBlur((g - blur) ** 2, (0, 0), 1.4), 0.0))
+    mask = np.clip((local - 2.8) / 9.0, 0.0, 1.0)
+    edges = cv2.Canny(gray, 35, 110).astype(np.float32) / 255.0
+    mask = np.maximum(mask, cv2.GaussianBlur(edges, (0, 0), 0.8) * 0.85)
+    return cv2.GaussianBlur(mask, (0, 0), 1.1)
+
+
+def _deepen_structured_blacks(
+    l_ch: np.ndarray, mask: np.ndarray, amount: float
+) -> np.ndarray:
+    """Aprofunda sombra em cabelo/tecido; não granula fundo liso."""
+    if amount <= 0.01:
+        return l_ch
+    x = l_ch.astype(np.float32)
+    shadow = np.clip((78.0 - x) / 78.0, 0.0, 1.0)
+    weight = shadow * (0.25 + 0.75 * mask.astype(np.float32))
+    return np.clip(x - (15.0 * amount) * weight, 0.0, 255.0)
+
+
+def _masked_micro_contrast(
+    l_ch: np.ndarray, mask: np.ndarray, amount: float
+) -> np.ndarray:
+    """Micro-textura só na máscara (cabelo/tecido). Pele e fundo ficam lisos."""
+    if amount <= 0.01:
+        return l_ch
+    high = _hf_unsharp_l(l_ch, sigma=0.75, amount=0.48 * amount, threshold=2.4)
+    clarity = _hf_unsharp_l(high, sigma=2.2, amount=0.20 * amount, threshold=4.0)
+    mix = mask.astype(np.float32)
+    out = (1.0 - mix) * l_ch.astype(np.float32) + mix * clarity.astype(np.float32)
+    return np.clip(out, 0, 255).astype(np.uint8)
+
+
 @dataclass(frozen=True)
 class RecoveryPlan:
     deblock: bool
@@ -271,7 +307,7 @@ def _l_contrast(rgb: np.ndarray) -> float:
 
 
 def assess_recovery(rgb: np.ndarray) -> RecoveryPlan:
-    """Deblock/Lanczos só em fonte mole/compactada. Original nítido: não mexer na geometria."""
+    """Deblock leve só em JPEG mole. Lanczos só se a fonte ficar limpa. Nítido: não mexer."""
     h, w = rgb.shape[:2]
     long_side = max(h, w)
     gray = cv2.cvtColor(rgb[..., :3], cv2.COLOR_RGB2GRAY)
@@ -280,7 +316,6 @@ def assess_recovery(rgb: np.ndarray) -> RecoveryPlan:
     small = long_side < 1400
     soft = lap < 70.0
 
-    # nítido (qualquer tamanho, inclusive thumbnail de estúdio) — sem deblock/Lanczos
     if lap >= 110.0:
         return RecoveryPlan(False, False, 1.0, "original nítido — sem upscale")
     if long_side >= 1400 and lap >= 70.0 and block < 1.20:
@@ -290,56 +325,47 @@ def assess_recovery(rgb: np.ndarray) -> RecoveryPlan:
     deblock = bool(small and (soft or compressed))
 
     scale = 1.0
-    # upscale só se for pequena E mole — thumbnail nítido não se estica
-    if small and soft:
-        target = 1920.0
-        scale = min(3.0, target / float(long_side))
-        if long_side * scale > 2560:
-            scale = 2560.0 / float(long_side)
-        if scale < 1.06:
+    # Lanczos só em fonte mole e relativamente limpa — não esticar bloco JPEG
+    if small and soft and block < 1.32:
+        target = 1600.0
+        scale = min(2.5, target / float(long_side))
+        if long_side * scale > 2200:
+            scale = 2200.0 / float(long_side)
+        if scale < 1.12:
             scale = 1.0
     scale = max(1.0, scale)
     upscale = scale > 1.0
     if deblock and upscale:
         reason = "JPEG/compactado + Lanczos"
     elif deblock:
-        reason = "desbloqueio de compressão"
+        reason = "desbloqueio leve"
     elif upscale:
-        reason = "Lanczos (fonte pequena ou mole)"
+        reason = "Lanczos (fonte mole e limpa)"
     else:
         reason = "sem recuperação"
     return RecoveryPlan(deblock, upscale, float(scale), reason)
 
 
 def _punch_amount(rgb: np.ndarray, plan: RecoveryPlan) -> float:
-    """0 = preservar arquivo bom; 1 = punch de bar. Pele/fundo lisos ficam lisos."""
+    """Quanto de punch. Já no nível de bar → toque curto; estúdio lavado → punch real."""
+    lab = cv2.cvtColor(rgb[..., :3], cv2.COLOR_RGB2LAB)
+    p1 = float(np.percentile(lab[:, :, 0], 1))
+    contrast = _l_contrast(rgb)
+    if contrast >= 198.0 and p1 <= 10.0:
+        return 0.40
     if plan.deblock or plan.upscale:
         return 1.0
-    gray = cv2.cvtColor(rgb[..., :3], cv2.COLOR_RGB2GRAY)
-    smooth = _smooth_fraction(gray)
-    lap = _laplacian_var(gray)
-    contrast = _l_contrast(rgb)
-    if smooth >= 0.60 and lap >= 80.0:
-        return 0.12
-    if contrast >= 165.0 and lap >= 100.0:
-        return 0.20
-    if smooth >= 0.50:
-        return 0.40
-    return 1.0
+    return 0.88
 
 
 def _deblock_compression(bgr: np.ndarray) -> np.ndarray:
-    """Suaviza artefato de bloco/mosquito sem apagar bordas."""
+    """Desbloqueio leve: chroma e mosquito, sem NLMeans que lava detalhe."""
     ycc = cv2.cvtColor(bgr, cv2.COLOR_BGR2YCrCb)
     y_ch, cr, cb = cv2.split(ycc)
     cr = cv2.medianBlur(cr, 3)
     cb = cv2.medianBlur(cb, 3)
-    y_ch = cv2.bilateralFilter(y_ch, 7, 22, 7)
-    cleaned = cv2.cvtColor(cv2.merge((y_ch, cr, cb)), cv2.COLOR_YCrCb2BGR)
-    h, w = cleaned.shape[:2]
-    if max(h, w) <= 1600:
-        cleaned = cv2.fastNlMeansDenoisingColored(cleaned, None, 3.5, 3.5, 7, 15)
-    return cleaned
+    y_ch = cv2.bilateralFilter(y_ch, 5, 14, 5)
+    return cv2.cvtColor(cv2.merge((y_ch, cr, cb)), cv2.COLOR_YCrCb2BGR)
 
 
 def _lanczos_upscale(bgr: np.ndarray, scale: float) -> np.ndarray:
@@ -367,7 +393,7 @@ def enhance_photo(
     cancel: Optional[threading.Event] = None,
     progress: Optional[ProgressFn] = None,
 ) -> np.ndarray:
-    """Recuperação só se a fonte for mole; punch proporcional. Nunca piora foto boa."""
+    """Punch de bar com máscara: pretos e micro-textura, pele/fundo lisos. Sem CLAHE em estúdio."""
     if rgb.ndim != 3 or rgb.shape[2] < 3:
         raise MediaError("imagem inválida.")
     _check(cancel)
@@ -389,48 +415,34 @@ def enhance_photo(
 
     _check(cancel)
     _report(progress, 22.0, "balanço de branco")
-    bgr = _white_balance(bgr, 0.12 + 0.38 * amount)
+    bgr = _white_balance(bgr, 0.16 + 0.12 * amount)
 
     lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB)
     l_ch, a_ch, b_ch = cv2.split(lab)
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    mask = _structure_mask(gray)
     smooth = _smooth_fraction(gray)
+    contrast = _l_contrast(original)
+    p1 = float(np.percentile(l_ch, 1))
 
-    if amount >= 0.35:
-        _check(cancel)
-        _report(progress, 38.0, "pretos e brancos")
-        l_ch = _levels_percentile(l_ch)
-
-        _check(cancel)
-        _report(progress, 58.0, "CLAHE")
-        l_ch = _clahe_l(l_ch, mix=0.35 + 0.25 * amount, clip=1.4 + 0.4 * amount)
-
-        _check(cancel)
-        _report(progress, 74.0, "nitidez")
-        hf = 0.85 * amount * (1.0 - 0.65 * min(smooth, 0.85))
-        edge = 2.0 + 10.0 * smooth
-        l_ch = _hf_unsharp_l(l_ch, sigma=0.8, amount=hf, threshold=edge)
-        l_ch = _hf_unsharp_l(
-            l_ch, sigma=2.2, amount=0.22 * amount * (1.0 - smooth), threshold=1.5
+    _check(cancel)
+    _report(progress, 40.0, "pretos e contraste")
+    if p1 > 12.0:
+        l_ch = _levels_percentile(
+            l_ch, low_p=0.8, high_p=99.55, floor=5.0, ceiling=251.0
         )
+    if smooth < 0.52 and contrast < 185.0 and amount >= 0.55:
+        _report(progress, 55.0, "CLAHE")
+        l_ch = _clahe_l(l_ch, mix=0.32 + 0.18 * amount, clip=1.35)
 
-        _check(cancel)
-        _report(progress, 88.0, "contraste")
-        l_ch = _s_curve_l(l_ch, amount=0.12 * amount)
-        floor = float(np.percentile(l_ch, 0.35))
-        if floor < 5.0:
-            lifted = l_ch.astype(np.float32)
-            crushed = lifted < 6.0
-            lifted[crushed] = 6.0 + lifted[crushed] * 0.4
-            l_ch = np.clip(lifted, 0, 255).astype(np.uint8)
-        a_ch, b_ch = _chroma_pop(a_ch, b_ch, 1.0 + 0.08 * amount)
-    else:
-        # arquivo já bom (estúdio, pele lisa): toque mínimo, sem CLAHE/grão
-        _report(progress, 60.0, "preservar")
-        contrast = _l_contrast(original)
-        if contrast < 140.0:
-            l_ch = _levels_percentile(l_ch, low_p=1.2, high_p=98.8, floor=10.0, ceiling=248.0)
-        l_ch = _hf_unsharp_l(l_ch, sigma=0.9, amount=0.16 * amount, threshold=12.0)
+    l_ch = _deepen_structured_blacks(l_ch, mask, amount)
+    l_ch = _s_curve_l(np.clip(l_ch, 0, 255).astype(np.uint8), amount=0.10 + 0.14 * amount)
+
+    _check(cancel)
+    _report(progress, 74.0, "textura")
+    l_ch = _masked_micro_contrast(l_ch, mask, amount)
+
+    a_ch, b_ch = _chroma_pop(a_ch, b_ch, 1.0 + 0.07 * amount)
 
     processed = cv2.cvtColor(cv2.merge((l_ch, a_ch, b_ch)), cv2.COLOR_LAB2BGR)
     processed = _bgr_to_rgb(processed)
