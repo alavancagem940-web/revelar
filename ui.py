@@ -168,7 +168,7 @@ class RevelarApp(ctk.CTk):
         )
         ctk.CTkButton(
             btns,
-            text="Remover da fila",
+            text="Remover imagem",
             fg_color=PANEL_2,
             hover_color="#333",
             command=self._remove_selected,
@@ -335,12 +335,19 @@ class RevelarApp(ctk.CTk):
     def _remove_selected(self) -> None:
         if self.selected is None:
             return
-        self.items = [item for item in self.items if item is not self.selected]
-        self.selected = self.items[0] if self.items else None
+        self._remove_item(self.selected)
+
+    def _remove_item(self, item: QueueItem) -> None:
+        if item.job_id:
+            self.jobs.drop_job(item.job_id)
+        was_selected = item is self.selected
+        self.items = [entry for entry in self.items if entry is not item]
+        if was_selected:
+            self.selected = self.items[0] if self.items else None
         self._render_queue()
-        if self.selected:
+        if was_selected and self.selected:
             self._select(self.selected)
-        else:
+        elif self.selected is None:
             self._paint_placeholders()
             self.preview_hint.configure(
                 text="Abra JPG, PNG, HEIC ou MP4/MOV. O tratamento começa sozinho."
@@ -362,18 +369,29 @@ class RevelarApp(ctk.CTk):
         for item in self.items:
             selected = item is self.selected
             color = "#3a3328" if selected else PANEL
+            row = ctk.CTkFrame(self.queue_scroll, fg_color=color, corner_radius=8)
+            row.pack(fill="x", pady=3, padx=2)
             label = f"{item.path.name}\n{item.kind} · {item.status}"
             btn = ctk.CTkButton(
-                self.queue_scroll,
+                row,
                 text=label,
                 anchor="w",
                 fg_color=color,
                 hover_color="#4a4336",
                 text_color=ERROR if item.error else TEXT,
                 command=lambda current=item: self._select(current),
-                height=52,
+                height=44,
             )
-            btn.pack(fill="x", pady=3, padx=2)
+            btn.pack(side="top", fill="x", padx=2, pady=(2, 0))
+            ctk.CTkButton(
+                row,
+                text="Remover imagem",
+                height=24,
+                fg_color=PANEL_2,
+                hover_color="#333",
+                text_color=MUTED,
+                command=lambda current=item: self._remove_item(current),
+            ).pack(side="top", fill="x", padx=2, pady=(2, 4))
             self._queue_buttons.append(btn)
 
     def _select(self, item: QueueItem) -> None:

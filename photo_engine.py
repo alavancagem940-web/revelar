@@ -1,8 +1,9 @@
-"""Aprimoramento automático de fotos: punch e nitidez em resolução nativa."""
+"""Aprimoramento automático de fotos: recuperação + punch em resolução nativa."""
 
 from __future__ import annotations
 
 import threading
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -216,6 +217,102 @@ def _s_curve_l(l_ch: np.ndarray, amount: float = 0.16) -> np.ndarray:
     return (y * 255.0).astype(np.uint8)
 
 
+@dataclass(frozen=True)
+class RecoveryPlan:
+    deblock: bool
+    upscale: bool
+    scale: float
+    reason: str
+
+
+def _blockiness(gray: np.ndarray) -> float:
+    """Razão de descontinuidade na grelha 8×8 típica de JPEG."""
+    g = gray.astype(np.float32)
+    if g.shape[1] < 16 or g.shape[0] < 16:
+        return 1.0
+    dx = np.abs(np.diff(g, axis=1))
+    dy = np.abs(np.diff(g, axis=0))
+    off = float(dx.mean() + dy.mean()) + 1e-6
+    on = float(dx[:, 7::8].mean() + dy[7::8, :].mean())
+    return on / off
+
+
+def _laplacian_var(gray: np.ndarray) -> float:
+    if max(gray.shape) > 1600:
+        scale = 1600 / max(gray.shape)
+        gray = cv2.resize(
+            gray,
+            (max(8, int(gray.shape[1] * scale)), max(8, int(gray.shape[0] * scale))),
+            interpolation=cv2.INTER_AREA,
+        )
+    return float(cv2.Laplacian(gray, cv2.CV_64F).var())
+
+
+def assess_recovery(rgb: np.ndarray) -> RecoveryPlan:
+    """Decide deblock/Lanczos. Nunca reduz um original nítido em resolução cheia."""
+    h, w = rgb.shape[:2]
+    long_side = max(h, w)
+    gray = cv2.cvtColor(rgb[..., :3], cv2.COLOR_RGB2GRAY)
+    lap = _laplacian_var(gray)
+    block = _blockiness(gray)
+    small = long_side < 1400
+    soft = lap < 70.0
+    # originais nítidos em resolução cheia: só punch, sem deblock/upscale
+    if long_side >= 1600 and lap >= 80.0 and block < 1.12:
+        return RecoveryPlan(False, False, 1.0, "original nítido — sem upscale")
+
+    compressed = block >= 1.15
+    deblock = (small and (compressed or soft)) or block >= 1.25
+
+    scale = 1.0
+    target = 1920.0
+    if small or (soft and long_side < 1920):
+        scale = min(3.0, target / float(long_side))
+        if long_side * scale > 2560:
+            scale = 2560.0 / float(long_side)
+        if scale < 1.06:
+            scale = 1.0
+    # jamais downscale
+    scale = max(1.0, scale)
+    upscale = scale > 1.0
+    if deblock and upscale:
+        reason = "JPEG/compactado + Lanczos"
+    elif deblock:
+        reason = "desbloqueio de compressão"
+    elif upscale:
+        reason = "Lanczos (fonte pequena ou mole)"
+    else:
+        reason = "sem recuperação"
+    return RecoveryPlan(deblock, upscale, float(scale), reason)
+
+
+def _deblock_compression(bgr: np.ndarray) -> np.ndarray:
+    """Suaviza artefato de bloco/mosquito sem apagar bordas."""
+    ycc = cv2.cvtColor(bgr, cv2.COLOR_BGR2YCrCb)
+    y_ch, cr, cb = cv2.split(ycc)
+    cr = cv2.medianBlur(cr, 3)
+    cb = cv2.medianBlur(cb, 3)
+    y_ch = cv2.bilateralFilter(y_ch, 7, 22, 7)
+    cleaned = cv2.cvtColor(cv2.merge((y_ch, cr, cb)), cv2.COLOR_YCrCb2BGR)
+    h, w = cleaned.shape[:2]
+    if max(h, w) <= 1600:
+        cleaned = cv2.fastNlMeansDenoisingColored(cleaned, None, 3.5, 3.5, 7, 15)
+    return cleaned
+
+
+def _lanczos_upscale(bgr: np.ndarray, scale: float) -> np.ndarray:
+    if scale <= 1.01:
+        return bgr
+    h, w = bgr.shape[:2]
+    nw = max(2, int(round(w * scale)))
+    nh = max(2, int(round(h * scale)))
+    nw -= nw % 2
+    nh -= nh % 2
+    if nw <= w and nh <= h:
+        return bgr
+    return cv2.resize(bgr, (nw, nh), interpolation=cv2.INTER_LANCZOS4)
+
+
 def _chroma_pop(a_ch: np.ndarray, b_ch: np.ndarray, factor: float = 1.07) -> tuple[np.ndarray, np.ndarray]:
     a = (a_ch.astype(np.float32) - 128.0) * factor + 128.0
     b = (b_ch.astype(np.float32) - 128.0) * factor + 128.0
@@ -228,16 +325,26 @@ def enhance_photo(
     cancel: Optional[threading.Event] = None,
     progress: Optional[ProgressFn] = None,
 ) -> np.ndarray:
-    """Punch + nitidez em resolução nativa (LAB). Sem downscale."""
+    """Recuperação (se preciso) + punch LAB. Nunca reduz original nítido."""
     if rgb.ndim != 3 or rgb.shape[2] < 3:
         raise MediaError("imagem inválida.")
     _check(cancel)
-    _report(progress, 6.0, "lendo")
+    _report(progress, 4.0, "lendo")
     original = np.ascontiguousarray(rgb[..., :3].astype(np.uint8))
     bgr = _rgb_to_bgr(original)
 
+    plan = assess_recovery(original)
+    if plan.deblock:
+        _check(cancel)
+        _report(progress, 10.0, "desbloqueando")
+        bgr = _deblock_compression(bgr)
+    if plan.upscale:
+        _check(cancel)
+        _report(progress, 16.0, "Lanczos")
+        bgr = _lanczos_upscale(bgr, plan.scale)
+
     _check(cancel)
-    _report(progress, 18.0, "balanço de branco")
+    _report(progress, 22.0, "balanço de branco")
     bgr = _white_balance(bgr, 0.5)
 
     lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB)
@@ -274,7 +381,7 @@ def enhance_photo(
 
     # intensity só existe por compatibilidade interna — a UI não tem slider.
     intensity = float(np.clip(intensity, 0.0, 1.0))
-    if intensity < 0.999:
+    if intensity < 0.999 and processed.shape == original.shape:
         blended = (
             original.astype(np.float32) * (1.0 - intensity)
             + processed.astype(np.float32) * intensity

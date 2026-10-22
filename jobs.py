@@ -96,6 +96,14 @@ class JobController:
                 UiEvent(type="progress", job_id=job_id, status="cancelando…", percent=-1)
             )
 
+    def drop_job(self, job_id: str) -> None:
+        """Tira um item da fila; se estiver a correr, cancela."""
+        with self._lock:
+            self._pending = [job for job in self._pending if job.job_id != job_id]
+            is_current = self._current_id == job_id
+        if is_current:
+            self.cancel_current()
+
     def take_result(self, job_id: str) -> Any:
         with self._lock:
             return self._results.pop(job_id, None)
