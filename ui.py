@@ -415,7 +415,6 @@ class RevelarApp(ctk.CTk):
                 self.queue_scroll,
                 text=label,
                 anchor="w",
-                justify="left",
                 fg_color=color,
                 hover_color=hover,
                 text_color=ERROR if item.error else TEXT,
