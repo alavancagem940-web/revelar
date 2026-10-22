@@ -18,7 +18,8 @@ if not os.environ.get("DISPLAY"):
 def main() -> None:
     from ui import run_app
 
-    run_app()
+    extra = [Path(arg) for arg in sys.argv[1:] if not str(arg).startswith("-")]
+    run_app(startup_paths=extra or None)
 
 
 if __name__ == "__main__":

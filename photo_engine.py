@@ -174,7 +174,7 @@ def _levels_percentile(
     return np.clip(out, 0, 255).astype(np.uint8)
 
 
-def _clahe_l(l_ch: np.ndarray) -> np.ndarray:
+def _clahe_l(l_ch: np.ndarray, mix: float = 0.5, clip: float = 1.6) -> np.ndarray:
     """CLAHE no L, clip baixo para não posterizar; mistura com o original."""
     h, w = l_ch.shape[:2]
     side = min(h, w)
@@ -186,10 +186,10 @@ def _clahe_l(l_ch: np.ndarray) -> np.ndarray:
         tile = 10
     else:
         tile = 8
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(tile, tile))
+    clahe = cv2.createCLAHE(clipLimit=float(clip), tileGridSize=(tile, tile))
     local = clahe.apply(l_ch)
-    # 65% local / 35% global evita halo e banding
-    mixed = 0.65 * local.astype(np.float32) + 0.35 * l_ch.astype(np.float32)
+    mix = float(np.clip(mix, 0.0, 1.0))
+    mixed = mix * local.astype(np.float32) + (1.0 - mix) * l_ch.astype(np.float32)
     return np.clip(mixed, 0, 255).astype(np.uint8)
 
 
@@ -248,8 +248,30 @@ def _laplacian_var(gray: np.ndarray) -> float:
     return float(cv2.Laplacian(gray, cv2.CV_64F).var())
 
 
+def _smooth_fraction(gray: np.ndarray) -> float:
+    """Fração de área lisa (pele, fundo de estúdio)."""
+    g = gray.astype(np.float32)
+    if max(g.shape) > 1200:
+        scale = 1200 / max(g.shape)
+        g = cv2.resize(
+            g,
+            (max(8, int(g.shape[1] * scale)), max(8, int(g.shape[0] * scale))),
+            interpolation=cv2.INTER_AREA,
+        )
+    mean = cv2.blur(g, (7, 7))
+    var = cv2.blur((g - mean) ** 2, (7, 7))
+    local = np.sqrt(np.maximum(var, 0.0))
+    return float((local < 6.5).mean())
+
+
+def _l_contrast(rgb: np.ndarray) -> float:
+    lab = cv2.cvtColor(rgb[..., :3], cv2.COLOR_RGB2LAB)
+    l_ch = lab[:, :, 0].astype(np.float32)
+    return float(np.percentile(l_ch, 95) - np.percentile(l_ch, 5))
+
+
 def assess_recovery(rgb: np.ndarray) -> RecoveryPlan:
-    """Decide deblock/Lanczos. Nunca reduz um original nítido em resolução cheia."""
+    """Deblock/Lanczos só em fonte mole/compactada. Original nítido: não mexer na geometria."""
     h, w = rgb.shape[:2]
     long_side = max(h, w)
     gray = cv2.cvtColor(rgb[..., :3], cv2.COLOR_RGB2GRAY)
@@ -257,22 +279,25 @@ def assess_recovery(rgb: np.ndarray) -> RecoveryPlan:
     block = _blockiness(gray)
     small = long_side < 1400
     soft = lap < 70.0
-    # originais nítidos em resolução cheia: só punch, sem deblock/upscale
-    if long_side >= 1600 and lap >= 80.0 and block < 1.12:
+
+    # nítido (qualquer tamanho, inclusive thumbnail de estúdio) — sem deblock/Lanczos
+    if lap >= 110.0:
+        return RecoveryPlan(False, False, 1.0, "original nítido — sem upscale")
+    if long_side >= 1400 and lap >= 70.0 and block < 1.20:
         return RecoveryPlan(False, False, 1.0, "original nítido — sem upscale")
 
-    compressed = block >= 1.15
-    deblock = (small and (compressed or soft)) or block >= 1.25
+    compressed = block >= 1.18 and lap < 90.0
+    deblock = bool(small and (soft or compressed))
 
     scale = 1.0
-    target = 1920.0
-    if small or (soft and long_side < 1920):
+    # upscale só se for pequena E mole — thumbnail nítido não se estica
+    if small and soft:
+        target = 1920.0
         scale = min(3.0, target / float(long_side))
         if long_side * scale > 2560:
             scale = 2560.0 / float(long_side)
         if scale < 1.06:
             scale = 1.0
-    # jamais downscale
     scale = max(1.0, scale)
     upscale = scale > 1.0
     if deblock and upscale:
@@ -284,6 +309,23 @@ def assess_recovery(rgb: np.ndarray) -> RecoveryPlan:
     else:
         reason = "sem recuperação"
     return RecoveryPlan(deblock, upscale, float(scale), reason)
+
+
+def _punch_amount(rgb: np.ndarray, plan: RecoveryPlan) -> float:
+    """0 = preservar arquivo bom; 1 = punch de bar. Pele/fundo lisos ficam lisos."""
+    if plan.deblock or plan.upscale:
+        return 1.0
+    gray = cv2.cvtColor(rgb[..., :3], cv2.COLOR_RGB2GRAY)
+    smooth = _smooth_fraction(gray)
+    lap = _laplacian_var(gray)
+    contrast = _l_contrast(rgb)
+    if smooth >= 0.60 and lap >= 80.0:
+        return 0.12
+    if contrast >= 165.0 and lap >= 100.0:
+        return 0.20
+    if smooth >= 0.50:
+        return 0.40
+    return 1.0
 
 
 def _deblock_compression(bgr: np.ndarray) -> np.ndarray:
@@ -325,7 +367,7 @@ def enhance_photo(
     cancel: Optional[threading.Event] = None,
     progress: Optional[ProgressFn] = None,
 ) -> np.ndarray:
-    """Recuperação (se preciso) + punch LAB. Nunca reduz original nítido."""
+    """Recuperação só se a fonte for mole; punch proporcional. Nunca piora foto boa."""
     if rgb.ndim != 3 or rgb.shape[2] < 3:
         raise MediaError("imagem inválida.")
     _check(cancel)
@@ -334,6 +376,8 @@ def enhance_photo(
     bgr = _rgb_to_bgr(original)
 
     plan = assess_recovery(original)
+    amount = _punch_amount(original, plan)
+
     if plan.deblock:
         _check(cancel)
         _report(progress, 10.0, "desbloqueando")
@@ -345,41 +389,52 @@ def enhance_photo(
 
     _check(cancel)
     _report(progress, 22.0, "balanço de branco")
-    bgr = _white_balance(bgr, 0.5)
+    bgr = _white_balance(bgr, 0.12 + 0.38 * amount)
 
     lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB)
     l_ch, a_ch, b_ch = cv2.split(lab)
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    smooth = _smooth_fraction(gray)
 
-    _check(cancel)
-    _report(progress, 38.0, "pretos e brancos")
-    l_ch = _levels_percentile(l_ch)
+    if amount >= 0.35:
+        _check(cancel)
+        _report(progress, 38.0, "pretos e brancos")
+        l_ch = _levels_percentile(l_ch)
 
-    _check(cancel)
-    _report(progress, 58.0, "CLAHE")
-    l_ch = _clahe_l(l_ch)
+        _check(cancel)
+        _report(progress, 58.0, "CLAHE")
+        l_ch = _clahe_l(l_ch, mix=0.35 + 0.25 * amount, clip=1.4 + 0.4 * amount)
 
-    _check(cancel)
-    _report(progress, 74.0, "nitidez")
-    # alta frequência (fios, dobras) + clareza local leve
-    l_ch = _hf_unsharp_l(l_ch, sigma=0.75, amount=1.28, threshold=2.0)
-    l_ch = _hf_unsharp_l(l_ch, sigma=2.1, amount=0.32, threshold=1.0)
+        _check(cancel)
+        _report(progress, 74.0, "nitidez")
+        hf = 0.85 * amount * (1.0 - 0.65 * min(smooth, 0.85))
+        edge = 2.0 + 10.0 * smooth
+        l_ch = _hf_unsharp_l(l_ch, sigma=0.8, amount=hf, threshold=edge)
+        l_ch = _hf_unsharp_l(
+            l_ch, sigma=2.2, amount=0.22 * amount * (1.0 - smooth), threshold=1.5
+        )
 
-    _check(cancel)
-    _report(progress, 88.0, "contraste")
-    l_ch = _s_curve_l(l_ch, amount=0.15)
-    # não esmagar o último detalhe de sombra no preto
-    floor = float(np.percentile(l_ch, 0.35))
-    if floor < 5.0:
-        lifted = l_ch.astype(np.float32)
-        crushed = lifted < 6.0
-        lifted[crushed] = 6.0 + lifted[crushed] * 0.4
-        l_ch = np.clip(lifted, 0, 255).astype(np.uint8)
-    a_ch, b_ch = _chroma_pop(a_ch, b_ch, 1.08)
+        _check(cancel)
+        _report(progress, 88.0, "contraste")
+        l_ch = _s_curve_l(l_ch, amount=0.12 * amount)
+        floor = float(np.percentile(l_ch, 0.35))
+        if floor < 5.0:
+            lifted = l_ch.astype(np.float32)
+            crushed = lifted < 6.0
+            lifted[crushed] = 6.0 + lifted[crushed] * 0.4
+            l_ch = np.clip(lifted, 0, 255).astype(np.uint8)
+        a_ch, b_ch = _chroma_pop(a_ch, b_ch, 1.0 + 0.08 * amount)
+    else:
+        # arquivo já bom (estúdio, pele lisa): toque mínimo, sem CLAHE/grão
+        _report(progress, 60.0, "preservar")
+        contrast = _l_contrast(original)
+        if contrast < 140.0:
+            l_ch = _levels_percentile(l_ch, low_p=1.2, high_p=98.8, floor=10.0, ceiling=248.0)
+        l_ch = _hf_unsharp_l(l_ch, sigma=0.9, amount=0.16 * amount, threshold=12.0)
 
     processed = cv2.cvtColor(cv2.merge((l_ch, a_ch, b_ch)), cv2.COLOR_LAB2BGR)
     processed = _bgr_to_rgb(processed)
 
-    # intensity só existe por compatibilidade interna — a UI não tem slider.
     intensity = float(np.clip(intensity, 0.0, 1.0))
     if intensity < 0.999 and processed.shape == original.shape:
         blended = (

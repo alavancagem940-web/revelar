@@ -68,12 +68,13 @@ def _caption_image(width: int, height: int, text: str) -> Image.Image:
 
 
 class RevelarApp(ctk.CTk):
-    def __init__(self) -> None:
+    def __init__(self, startup_paths: Optional[list[Path]] = None) -> None:
         super().__init__()
         self.title(APP_TITLE)
         self.geometry("1280x800")
         self.minsize(960, 620)
         self.configure(fg_color=BG)
+        self._startup_paths = [Path(p) for p in (startup_paths or [])]
 
         self.events: queue.Queue[UiEvent] = queue.Queue()
         self.jobs = JobController(self.events)
@@ -560,6 +561,11 @@ class RevelarApp(ctk.CTk):
             return
 
     def _load_samples(self) -> None:
+        if self.items:
+            return
+        if self._startup_paths:
+            self._add_paths(self._startup_paths, select_first=True)
+            return
         folder = Path(__file__).resolve().parent / "amostras"
         if not folder.is_dir():
             return
@@ -570,7 +576,7 @@ class RevelarApp(ctk.CTk):
                 if path.is_file() and (is_photo(path) or is_video(path))
             ]
         )
-        if files and not self.items:
+        if files:
             self._add_paths(files, select_first=True)
             self.preview_hint.configure(
                 text="Amostras na fila — o tratamento automático já começou."
@@ -589,13 +595,13 @@ class RevelarApp(ctk.CTk):
         self.destroy()
 
 
-def run_app() -> None:
+def run_app(startup_paths: Optional[list[Path]] = None) -> None:
     ctk.set_appearance_mode("dark")
     try:
         ctk.set_default_color_theme("gold")
     except Exception:
         ctk.set_default_color_theme("dark-blue")
-    app = RevelarApp()
+    app = RevelarApp(startup_paths=startup_paths)
     app.mainloop()
 
 

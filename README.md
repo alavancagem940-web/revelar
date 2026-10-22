@@ -7,7 +7,7 @@ Revelar não é o TrilhaPy nem o Inglês Real. Não pede login, não usa nuvem e
 ## O que ele faz
 
 - Abre **JPG, PNG, HEIC** e **MP4 / MOV** (um ou vários arquivos, com fila visível).
-- Fotos: se a fonte for pequena, mole ou JPEG compactado, **desbloqueia compressão** e faz **upscale Lanczos** (`INTER_LANCZOS4`); originais nítidos em resolução cheia **não** são reduzidos. Depois o punch (CLAHE no L, unsharp de alta frequência, pretos/brancos). JPEG q≈94 / PNG sRGB.
+- Fotos: deblock + Lanczos **só** em JPEG mole/compactado. Original nítido (mesmo thumbnail de estúdio) não é desbloqueado nem esticado. Punch forte em cena texturizada; pele e fundo lisos ficam lisos. JPEG q≈94 / PNG sRGB.
 - Fila: botão **Remover imagem** para tirar arquivo aberto por engano ou duplicado.
 - Vídeos: equalização de cor, estabilização leve e otimização de bitrate, num **único passe** de exportação.
 - **100% automático:** sem slider de intensidade, sem barras de exposição, sem toque em “Aplicar”. Ao abrir um arquivo (ou as amostras), o pipeline profissional já corre em `threading.Thread`.
