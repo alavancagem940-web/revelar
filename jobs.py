@@ -22,12 +22,15 @@ from export_ios import (
 from photo_engine import enhance_photo, is_photo, is_video, load_image
 from video_engine import enhance_and_export_video, enhance_frame, first_frame
 
+# Força profissional interna — sem slider na UI.
+AUTO_INTENSITY = 0.72
+
 
 @dataclass
 class JobRequest:
     kind: str
     source: Path
-    intensity: float = 0.65
+    intensity: float = AUTO_INTENSITY
     output_dir: Optional[Path] = None
     image_format: str = "jpeg"
     rgb: Optional[np.ndarray] = None
@@ -249,24 +252,30 @@ class JobController:
                 raise FFmpegMissing()
             folder = Path(job.output_dir or Path.home() / "Revelar")
             dest = next_export_path(folder, "video", ".mp4")
+            last_frame: list[np.ndarray] = []
+
             def live(frame: np.ndarray) -> None:
+                thumb = _thumb(frame, 480)
+                last_frame[:] = [thumb]
                 self.events.put(
                     UiEvent(
                         type="live_frame",
                         job_id=job.job_id,
                         path=src,
-                        preview_rgb=_thumb(frame, 480),
+                        preview_rgb=thumb,
                     )
                 )
 
             enhance_and_export_video(
                 src,
                 dest,
-                intensity=job.intensity,
+                intensity=job.intensity if job.intensity else AUTO_INTENSITY,
                 cancel=self._cancel,
                 progress=lambda p, s: self._progress(job, p, s),
                 live_preview=live,
             )
+            if last_frame:
+                self._store(job.job_id, last_frame[0])
             self.events.put(
                 UiEvent(
                     type="done",
@@ -275,6 +284,7 @@ class JobController:
                     status=f"salvo: {dest.name}",
                     percent=100.0,
                     output_path=dest,
+                    preview_rgb=last_frame[0] if last_frame else None,
                 )
             )
             return

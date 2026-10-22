@@ -1,4 +1,4 @@
-"""Interface Revelar — CustomTkinter, modo escuro, português."""
+"""Interface Revelar — CustomTkinter, modo escuro, 100% automático."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
 from export_ios import find_ffmpeg
-from jobs import JobController, JobRequest, UiEvent
+from jobs import AUTO_INTENSITY, JobController, JobRequest, UiEvent
 from photo_engine import is_photo, is_video
 
 APP_TITLE = "Revelar"
@@ -22,7 +22,6 @@ PANEL_2 = "#242424"
 TEXT = "#EDE6D6"
 MUTED = "#9A907E"
 ERROR = "#E07070"
-OK = "#8FCB8F"
 
 FILETYPES = [
     (
@@ -46,6 +45,7 @@ class QueueItem:
     output_path: Optional[Path] = None
     error: str = ""
     job_id: Optional[str] = None
+    started: bool = False
 
 
 def _fit_pil(rgb: np.ndarray, max_w: int, max_h: int) -> Image.Image:
@@ -85,12 +85,8 @@ class RevelarApp(ctk.CTk):
         self._queue_buttons: list[ctk.CTkButton] = []
         self.output_dir = Path.home() / "Revelar"
         self.output_dir.mkdir(parents=True, exist_ok=True)
-
-        self.intensity = ctk.DoubleVar(value=65.0)
-        self.compare = ctk.BooleanVar(value=False)
-        self.photo_format = ctk.StringVar(value="JPEG")
-
         self._resize_after: Optional[str] = None
+
         self._build()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.bind("<Configure>", self._on_resize)
@@ -100,16 +96,15 @@ class RevelarApp(ctk.CTk):
 
     def _idle_status(self) -> str:
         if find_ffmpeg():
-            return "Pronto. Exportação de vídeo: MP4 H.264 + AAC."
+            return "Automático. Vídeo: MP4 H.264 + AAC · foto: JPEG sRGB."
         return (
-            "Pronto. ffmpeg não encontrado — fotos ok; "
+            "Automático. ffmpeg não encontrado — fotos ok; "
             "instale o ffmpeg para exportar vídeo H.264 + AAC."
         )
 
     def _build(self) -> None:
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(1, weight=1)
-
         self._header()
         self._body()
         self._footer()
@@ -128,7 +123,7 @@ class RevelarApp(ctk.CTk):
         title.grid(row=0, column=0, padx=(22, 12), pady=(12, 0), sticky="w")
         subtitle = ctk.CTkLabel(
             bar,
-            text="Aprimoramento automático de fotos e vídeos · arquivos prontos para o iPhone",
+            text="100% automático · antes e depois · arquivos prontos para o iPhone",
             font=ctk.CTkFont(size=13),
             text_color=MUTED,
         )
@@ -136,9 +131,9 @@ class RevelarApp(ctk.CTk):
 
         out_wrap = ctk.CTkFrame(bar, fg_color="transparent")
         out_wrap.grid(row=0, column=1, rowspan=2, padx=16, pady=12, sticky="e")
-        ctk.CTkLabel(out_wrap, text="Pasta de saída", text_color=MUTED, font=ctk.CTkFont(size=12)).pack(
-            anchor="e"
-        )
+        ctk.CTkLabel(
+            out_wrap, text="Pasta de saída", text_color=MUTED, font=ctk.CTkFont(size=12)
+        ).pack(anchor="e")
         row = ctk.CTkFrame(out_wrap, fg_color="transparent")
         row.pack(fill="x")
         self.out_entry = ctk.CTkEntry(row, width=340, text_color=TEXT)
@@ -153,10 +148,8 @@ class RevelarApp(ctk.CTk):
         body.grid(row=1, column=0, sticky="nsew", padx=14, pady=10)
         body.grid_columnconfigure(1, weight=1)
         body.grid_rowconfigure(0, weight=1)
-
         self._build_queue(body)
         self._build_preview(body)
-        self._build_controls(body)
 
     def _build_queue(self, parent: ctk.CTkFrame) -> None:
         panel = ctk.CTkFrame(parent, fg_color=PANEL, width=280, corner_radius=12)
@@ -192,12 +185,8 @@ class RevelarApp(ctk.CTk):
         panel.grid_columnconfigure(1, weight=1)
         panel.grid_rowconfigure(1, weight=1)
 
-        ctk.CTkLabel(panel, text="Original", text_color=MUTED).grid(
-            row=0, column=0, pady=(12, 0)
-        )
-        ctk.CTkLabel(panel, text="Resultado", text_color=MUTED).grid(
-            row=0, column=1, pady=(12, 0)
-        )
+        ctk.CTkLabel(panel, text="Antes", text_color=MUTED).grid(row=0, column=0, pady=(12, 0))
+        ctk.CTkLabel(panel, text="Depois", text_color=MUTED).grid(row=0, column=1, pady=(12, 0))
 
         self.lbl_orig = ctk.CTkLabel(panel, text="", fg_color="#141414", corner_radius=8)
         self.lbl_orig.grid(row=1, column=0, padx=(12, 6), pady=10, sticky="nsew")
@@ -207,89 +196,18 @@ class RevelarApp(ctk.CTk):
 
         self.preview_hint = ctk.CTkLabel(
             panel,
-            text="Abra JPG, PNG, HEIC ou MP4/MOV. O resultado aparece após aplicar o automático.",
+            text="Abra JPG, PNG, HEIC ou MP4/MOV. O tratamento começa sozinho.",
             text_color=MUTED,
             font=ctk.CTkFont(size=12),
         )
-        self.preview_hint.grid(row=2, column=0, columnspan=2, pady=(0, 12))
-
-    def _build_controls(self, parent: ctk.CTkFrame) -> None:
-        panel = ctk.CTkFrame(parent, fg_color=PANEL, width=300, corner_radius=12)
-        panel.grid(row=0, column=2, sticky="nsew", padx=(10, 0))
-        panel.grid_propagate(False)
-
-        inner = ctk.CTkFrame(panel, fg_color="transparent")
-        inner.pack(fill="both", expand=True, padx=14, pady=14)
-
-        ctk.CTkLabel(
-            inner, text="Revelação", font=ctk.CTkFont(size=16, weight="bold"), text_color=TEXT
-        ).pack(anchor="w", pady=(0, 10))
-
-        ctk.CTkLabel(inner, text="Intensidade", text_color=MUTED).pack(anchor="w")
-        slide_row = ctk.CTkFrame(inner, fg_color="transparent")
-        slide_row.pack(fill="x", pady=(2, 4))
-        ctk.CTkLabel(slide_row, text="Suave", text_color=MUTED, font=ctk.CTkFont(size=11)).pack(
-            side="left"
+        self.preview_hint.grid(row=2, column=0, columnspan=2, padx=12, pady=(0, 4))
+        self.export_hint = ctk.CTkLabel(
+            panel,
+            text=f"Pasta de saída: {self.output_dir}",
+            text_color=TEXT,
+            font=ctk.CTkFont(size=13),
         )
-        ctk.CTkLabel(slide_row, text="Forte", text_color=MUTED, font=ctk.CTkFont(size=11)).pack(
-            side="right"
-        )
-        ctk.CTkSlider(inner, from_=0, to=100, variable=self.intensity).pack(fill="x", pady=(0, 12))
-
-        self.btn_apply = ctk.CTkButton(
-            inner, text="Aplicar automático", height=36, command=self._apply
-        )
-        self.btn_apply.pack(fill="x", pady=4)
-        ctk.CTkSwitch(
-            inner,
-            text="Comparar antes/depois",
-            variable=self.compare,
-            command=self._refresh_previews,
-        ).pack(anchor="w", pady=10)
-        self.btn_undo = ctk.CTkButton(
-            inner,
-            text="Desfazer",
-            fg_color=PANEL_2,
-            hover_color="#333",
-            command=self._undo,
-        )
-        self.btn_undo.pack(fill="x", pady=4)
-
-        ctk.CTkLabel(inner, text="Foto exportada", text_color=MUTED).pack(
-            anchor="w", pady=(18, 4)
-        )
-        ctk.CTkSegmentedButton(
-            inner, values=["JPEG", "PNG"], variable=self.photo_format
-        ).pack(fill="x")
-        ctk.CTkLabel(
-            inner,
-            text="JPEG alta qualidade (q≈94) ou PNG, perfil sRGB.\nVídeo: sempre MP4 H.264 + AAC.",
-            font=ctk.CTkFont(size=11),
-            text_color=MUTED,
-            justify="left",
-        ).pack(anchor="w", pady=(6, 10))
-
-        self.btn_export = ctk.CTkButton(
-            inner, text="Exportar selecionado", height=36, command=self._export_selected
-        )
-        self.btn_export.pack(fill="x", pady=4)
-        self.btn_export_all = ctk.CTkButton(
-            inner,
-            text="Exportar fila",
-            fg_color=PANEL_2,
-            hover_color="#333",
-            command=self._export_queue,
-        )
-        self.btn_export_all.pack(fill="x", pady=4)
-
-        ctk.CTkLabel(
-            inner,
-            text="Sem login, sem nuvem. Tudo no seu computador.",
-            font=ctk.CTkFont(size=11),
-            text_color=MUTED,
-            wraplength=250,
-            justify="left",
-        ).pack(anchor="w", pady=(18, 0))
+        self.export_hint.grid(row=3, column=0, columnspan=2, padx=12, pady=(0, 12))
 
     def _footer(self) -> None:
         bar = ctk.CTkFrame(self, fg_color=PANEL, corner_radius=0, height=64)
@@ -316,22 +234,20 @@ class RevelarApp(ctk.CTk):
     def _paint_placeholders(self) -> None:
         w, h = self._preview_box()
         orig = _caption_image(w, h, "Sem pré-visualização")
-        res = _caption_image(w, h, "Aplique o automático para ver o resultado")
+        res = _caption_image(w, h, "Revelando automaticamente…")
         self._img_orig = ctk.CTkImage(light_image=orig, dark_image=orig, size=(w, h))
         self._img_res = ctk.CTkImage(light_image=res, dark_image=res, size=(w, h))
         self.lbl_orig.configure(image=self._img_orig, text="")
         self.lbl_res.configure(image=self._img_res, text="")
 
     def _preview_box(self) -> tuple[int, int]:
-        width = max(280, (int(self.winfo_width() or 1280) - 640) // 2)
-        height = max(200, int(self.winfo_height() or 800) - 300)
-        return min(width, 640), min(height, 520)
+        width = max(320, (int(self.winfo_width() or 1280) - 340) // 2)
+        height = max(220, int(self.winfo_height() or 800) - 280)
+        return min(width, 720), min(height, 560)
 
     def _set_status(self, text: str, percent: Optional[float] = None, error: bool = False) -> None:
         self.status.configure(text=text, text_color=ERROR if error else TEXT)
-        if percent is not None:
-            if percent < 0:
-                return
+        if percent is not None and percent >= 0:
             self.progress.set(max(0.0, min(1.0, percent / 100.0)))
         self.btn_cancel.configure(state="normal" if self.jobs.busy else "disabled")
 
@@ -350,6 +266,14 @@ class RevelarApp(ctk.CTk):
             self.out_entry.delete(0, "end")
             self.out_entry.insert(0, chosen)
             self.output_dir = Path(chosen)
+            self._refresh_export_hint()
+
+    def _refresh_export_hint(self) -> None:
+        item = self.selected
+        if item and item.output_path:
+            self.export_hint.configure(text=f"Exportado: {item.output_path}")
+        else:
+            self.export_hint.configure(text=f"Pasta de saída: {self._output_dir()}")
 
     def _open_files(self) -> None:
         paths = ctk.filedialog.askopenfilenames(title="Abrir fotos ou vídeos", filetypes=FILETYPES)
@@ -377,8 +301,36 @@ class RevelarApp(ctk.CTk):
             added.append(item)
             known.add(path.resolve())
         self._render_queue()
+        for item in added:
+            self._start_auto(item)
         if added and select_first:
             self._select(added[0])
+
+    def _start_auto(self, item: QueueItem) -> None:
+        if item.started or item.output_path is not None:
+            return
+        folder = self._output_dir()
+        if item.kind == "foto":
+            job = JobRequest(
+                kind="photo_export",
+                source=item.path,
+                intensity=AUTO_INTENSITY,
+                output_dir=folder,
+                image_format="jpeg",
+            )
+        else:
+            job = JobRequest(
+                kind="video_export",
+                source=item.path,
+                intensity=AUTO_INTENSITY,
+                output_dir=folder,
+            )
+        item.job_id = self.jobs.enqueue(job)
+        item.started = True
+        item.status = "na fila"
+        item.error = ""
+        self._render_queue()
+        self.btn_cancel.configure(state="normal")
 
     def _remove_selected(self) -> None:
         if self.selected is None:
@@ -391,8 +343,9 @@ class RevelarApp(ctk.CTk):
         else:
             self._paint_placeholders()
             self.preview_hint.configure(
-                text="Abra JPG, PNG, HEIC ou MP4/MOV. O resultado aparece após aplicar o automático."
+                text="Abra JPG, PNG, HEIC ou MP4/MOV. O tratamento começa sozinho."
             )
+            self._refresh_export_hint()
 
     def _render_queue(self) -> None:
         for child in self.queue_scroll.winfo_children():
@@ -409,14 +362,13 @@ class RevelarApp(ctk.CTk):
         for item in self.items:
             selected = item is self.selected
             color = "#3a3328" if selected else PANEL
-            hover = "#4a4336"
             label = f"{item.path.name}\n{item.kind} · {item.status}"
             btn = ctk.CTkButton(
                 self.queue_scroll,
                 text=label,
                 anchor="w",
                 fg_color=color,
-                hover_color=hover,
+                hover_color="#4a4336",
                 text_color=ERROR if item.error else TEXT,
                 command=lambda current=item: self._select(current),
                 height=52,
@@ -435,77 +387,8 @@ class RevelarApp(ctk.CTk):
         else:
             self._paint_placeholders()
             self.preview_hint.configure(text=f"Lendo {item.path.name}…")
+        self._refresh_export_hint()
         self.jobs.request_preview(item.path, token)
-
-    def _intensity(self) -> float:
-        return float(self.intensity.get()) / 100.0
-
-    def _apply(self) -> None:
-        item = self.selected
-        if item is None:
-            self._set_status("Abra um arquivo primeiro.", 0)
-            return
-        kind = "photo_enhance" if item.kind == "foto" else "video_preview"
-        job_id = self.jobs.enqueue(
-            JobRequest(kind=kind, source=item.path, intensity=self._intensity())
-        )
-        item.job_id = job_id
-        item.status = "processando"
-        item.error = ""
-        self._render_queue()
-        self._set_status(f"lendo — {item.path.name}", 1)
-        self.btn_cancel.configure(state="normal")
-
-    def _undo(self) -> None:
-        item = self.selected
-        if item is None:
-            return
-        item.processed_rgb = None
-        item.output_path = None
-        item.error = ""
-        item.status = "na fila"
-        self.compare.set(False)
-        self._render_queue()
-        self._refresh_previews()
-        self.preview_hint.configure(text="Último resultado desfeito.")
-
-    def _export_selected(self) -> None:
-        item = self.selected
-        if item is None:
-            self._set_status("Selecione um arquivo na fila.", 0)
-            return
-        self._enqueue_export(item)
-
-    def _export_queue(self) -> None:
-        if not self.items:
-            self._set_status("A fila está vazia.", 0)
-            return
-        for item in self.items:
-            self._enqueue_export(item)
-
-    def _enqueue_export(self, item: QueueItem) -> None:
-        folder = self._output_dir()
-        if item.kind == "foto":
-            job = JobRequest(
-                kind="photo_export",
-                source=item.path,
-                intensity=self._intensity(),
-                output_dir=folder,
-                image_format="png" if self.photo_format.get() == "PNG" else "jpeg",
-                rgb=item.processed_rgb,
-            )
-        else:
-            job = JobRequest(
-                kind="video_export",
-                source=item.path,
-                intensity=self._intensity(),
-                output_dir=folder,
-            )
-        item.job_id = self.jobs.enqueue(job)
-        item.status = "na fila"
-        item.error = ""
-        self._render_queue()
-        self.btn_cancel.configure(state="normal")
 
     def _cancel(self) -> None:
         self.jobs.cancel_current()
@@ -534,22 +417,18 @@ class RevelarApp(ctk.CTk):
         item = self.selected
         if item is None:
             self._paint_placeholders()
+            self._refresh_export_hint()
             return
         if item.original_preview is not None:
             self._show_original(item.original_preview)
-        if self.compare.get() and item.original_preview is not None:
-            self._show_result(item.original_preview, "Original")
-            self.preview_hint.configure(text="Comparar ligado — o painel da direita mostra o original.")
-            return
         if item.processed_rgb is not None:
             self._show_result(item.processed_rgb, "")
-            extra = f" · exportado: {item.output_path.name}" if item.output_path else ""
+            extra = f" · {item.output_path.name}" if item.output_path else ""
             self.preview_hint.configure(text=f"{item.path.name}{extra}")
         else:
-            self._show_result(None, "Aplique o automático para ver o resultado")
-            self.preview_hint.configure(
-                text="Original à esquerda. Aplique o automático ou exporte para gerar o resultado."
-            )
+            self._show_result(None, "Revelando automaticamente…")
+            self.preview_hint.configure(text=f"Tratando {item.path.name} em segundo plano.")
+        self._refresh_export_hint()
 
     def _item_by_job(self, event: UiEvent) -> Optional[QueueItem]:
         if event.job_id:
@@ -609,8 +488,10 @@ class RevelarApp(ctk.CTk):
             return
 
         if event.type == "live_frame":
-            if item is not None and item is self.selected and event.preview_rgb is not None:
-                if not self.compare.get():
+            if item is not None:
+                if event.preview_rgb is not None:
+                    item.processed_rgb = event.preview_rgb
+                if item is self.selected and event.preview_rgb is not None:
                     self._show_result(event.preview_rgb, "")
             return
 
@@ -643,6 +524,7 @@ class RevelarApp(ctk.CTk):
         if event.type == "cancelled":
             if item:
                 item.status = "cancelado"
+                item.started = False
                 self._render_queue()
             self._set_status("Cancelado.", 0)
             if not self.jobs.busy:
@@ -673,7 +555,7 @@ class RevelarApp(ctk.CTk):
         if files and not self.items:
             self._add_paths(files, select_first=True)
             self.preview_hint.configure(
-                text="Amostras carregadas. Aplique o automático ou exporte para o iPhone."
+                text="Amostras na fila — o tratamento automático já começou."
             )
 
     def _on_resize(self, _event) -> None:

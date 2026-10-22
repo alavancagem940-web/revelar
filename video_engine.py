@@ -66,7 +66,7 @@ def first_frame(path: Path | str) -> np.ndarray:
 
 def enhance_frame(
     rgb: np.ndarray,
-    intensity: float = 0.65,
+    intensity: float = 0.72,
     gains: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """Equalização de um quadro (RGB). Sem denoise pesado — adequado a vídeo."""
@@ -197,7 +197,7 @@ def _warp_rgb(rgb: np.ndarray, dx: float, dy: float, crop: float) -> np.ndarray:
 def enhance_and_export_video(
     source: Path | str,
     dest: Path | str,
-    intensity: float = 0.65,
+    intensity: float = 0.72,
     cancel: Optional[threading.Event] = None,
     progress: Optional[ProgressFn] = None,
     live_preview: Optional[Callable[[np.ndarray], None]] = None,

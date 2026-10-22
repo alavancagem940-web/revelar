@@ -162,7 +162,7 @@ def _denoise(bgr: np.ndarray, strength: float) -> np.ndarray:
 
 def enhance_photo(
     rgb: np.ndarray,
-    intensity: float = 0.65,
+    intensity: float = 0.72,
     cancel: Optional[threading.Event] = None,
     progress: Optional[ProgressFn] = None,
 ) -> np.ndarray:

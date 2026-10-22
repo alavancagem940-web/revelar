@@ -9,8 +9,8 @@ Revelar não é o TrilhaPy nem o Inglês Real. Não pede login, não usa nuvem e
 - Abre **JPG, PNG, HEIC** e **MP4 / MOV** (um ou vários arquivos, com fila visível).
 - Fotos: exposição automática, contraste adaptativo (CLAHE), balanço de branco, nitidez (unsharp mask) e redução de ruído (OpenCV + Pillow).
 - Vídeos: equalização de cor, estabilização leve e otimização de bitrate, num **único passe** de exportação.
-- Controles: aplicar automático, intensidade, comparar antes/depois, desfazer.
-- A janela continua usável enquanto processa: dá para enfileirar outro arquivo, cancelar o job e mudar o preview.
+- **100% automático:** sem slider de intensidade, sem barras de exposição, sem toque em “Aplicar”. Ao abrir um arquivo (ou as amostras), o pipeline profissional já corre em `threading.Thread`.
+- A janela mostra **antes/depois**, progresso/status e a **pasta de saída**. Dá para enfileirar outro arquivo, cancelar o job e mudar o preview enquanto processa.
 
 ## Formato iPhone (arquivo, não IPA)
 
@@ -42,9 +42,9 @@ sudo apt install python3-tk ffmpeg libheif1
 
 No macOS: `brew install ffmpeg libheif`.
 
-Amostras curtas ficam em `amostras/` (uma foto subexposta e um MP4 de 2 s). Na primeira abertura o app carrega essa pasta na fila.
+Amostras curtas ficam em `amostras/` (uma foto subexposta e um MP4 de 2 s). Na primeira abertura o app carrega essa pasta e **já revela** sozinho.
 
-Pasta de saída padrão: `~/Revelar`. Você escolhe outra no topo da janela.
+Pasta de saída padrão: `~/Revelar`. Você escolhe outra no topo da janela; JPEG (q≈94, sRGB) e MP4 H.264+AAC são gravados lá automaticamente.
 
 ## Como passar os arquivos para o iPhone
 
