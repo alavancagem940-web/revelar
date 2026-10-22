@@ -1,4 +1,4 @@
-"""Aprimoramento automático de fotos: recuperação + punch em resolução nativa."""
+"""Aprimoramento automático de fotos: detalhe tipo celular, sem HDR/contraste no retrato."""
 
 from __future__ import annotations
 
@@ -306,56 +306,114 @@ def _l_contrast(rgb: np.ndarray) -> float:
     return float(np.percentile(l_ch, 95) - np.percentile(l_ch, 5))
 
 
+PHONE_LONG_SIDE = 1600.0
+
+
 def assess_recovery(rgb: np.ndarray) -> RecoveryPlan:
-    """Deblock leve só em JPEG mole. Lanczos só se a fonte ficar limpa. Nítido: não mexer."""
+    """Fonte pequena (anexo de chat) → upscale limpo a ~1600. Deblock só se for mole."""
     h, w = rgb.shape[:2]
     long_side = max(h, w)
     gray = cv2.cvtColor(rgb[..., :3], cv2.COLOR_RGB2GRAY)
     lap = _laplacian_var(gray)
-    block = _blockiness(gray)
     small = long_side < 1400
     soft = lap < 70.0
 
-    if lap >= 110.0:
-        return RecoveryPlan(False, False, 1.0, "original nítido — sem upscale")
-    if long_side >= 1400 and lap >= 70.0 and block < 1.20:
-        return RecoveryPlan(False, False, 1.0, "original nítido — sem upscale")
+    if long_side >= 1400 and lap >= 70.0:
+        return RecoveryPlan(False, False, 1.0, "já em tamanho de celular")
 
-    compressed = block >= 1.18 and lap < 90.0
-    deblock = bool(small and (soft or compressed))
+    deblock = bool(small and soft)
 
     scale = 1.0
-    # Lanczos só em fonte mole e relativamente limpa — não esticar bloco JPEG
-    if small and soft and block < 1.32:
-        target = 1600.0
-        scale = min(2.5, target / float(long_side))
-        if long_side * scale > 2200:
-            scale = 2200.0 / float(long_side)
+    if small:
+        scale = min(4.8, PHONE_LONG_SIDE / float(long_side))
+        if long_side * scale > 1800:
+            scale = 1800.0 / float(long_side)
         if scale < 1.12:
             scale = 1.0
     scale = max(1.0, scale)
     upscale = scale > 1.0
     if deblock and upscale:
-        reason = "JPEG/compactado + Lanczos"
+        reason = "JPEG mole + upscale limpo"
     elif deblock:
         reason = "desbloqueio leve"
     elif upscale:
-        reason = "Lanczos (fonte mole e limpa)"
+        reason = "upscale limpo tipo celular"
     else:
         reason = "sem recuperação"
     return RecoveryPlan(deblock, upscale, float(scale), reason)
 
 
-def _punch_amount(rgb: np.ndarray, plan: RecoveryPlan) -> float:
-    """Quanto de punch. Já no nível de bar → toque curto; estúdio lavado → punch real."""
+def _underexposed(rgb: np.ndarray) -> bool:
     lab = cv2.cvtColor(rgb[..., :3], cv2.COLOR_RGB2LAB)
-    p1 = float(np.percentile(lab[:, :, 0], 1))
-    contrast = _l_contrast(rgb)
-    if contrast >= 198.0 and p1 <= 10.0:
-        return 0.40
-    if plan.deblock or plan.upscale:
-        return 1.0
-    return 0.88
+    mean_l = float(lab[:, :, 0].mean())
+    return mean_l < 58.0 and _l_contrast(rgb) < 95.0
+
+
+def _iterative_backproject_l(
+    l_ch: np.ndarray, nw: int, nh: int, iters: int = 8
+) -> np.ndarray:
+    """Reconstrói L em alta res para ficar fiel ao original quando rebaixado."""
+    h, w = l_ch.shape[:2]
+    src = l_ch.astype(np.float32)
+    hr = cv2.resize(src, (nw, nh), interpolation=cv2.INTER_LANCZOS4)
+    for _ in range(iters):
+        down = cv2.resize(hr, (w, h), interpolation=cv2.INTER_AREA)
+        err_up = cv2.resize(src - down, (nw, nh), interpolation=cv2.INTER_CUBIC)
+        hr = np.clip(hr + 0.9 * err_up, 0.0, 255.0)
+    return hr
+
+
+def _protect_smooth(bgr: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    """Fundo e pele lisos; cabelo/tecido ficam com o detalhe reconstruído."""
+    bg = cv2.GaussianBlur(bgr, (0, 0), 2.2)
+    skin = cv2.bilateralFilter(bgr, 7, 14, 5)
+    m = mask.astype(np.float32)[..., None]
+    mix_bg = np.clip(1.0 - m * 4.0, 0.0, 1.0)
+    mix_st = np.clip((m - 0.22) / 0.55, 0.0, 1.0)
+    mix_skin = np.clip(1.0 - mix_bg - mix_st, 0.0, 1.0)
+    out = (
+        bg.astype(np.float32) * mix_bg
+        + skin.astype(np.float32) * mix_skin
+        + bgr.astype(np.float32) * mix_st
+    )
+    return np.clip(out, 0, 255).astype(np.uint8)
+
+
+def _clean_phone_upscale(bgr: np.ndarray, scale: float) -> np.ndarray:
+    """Upscale tipo celular: backprojection no L, chroma Lanczos, sem CLAHE."""
+    if scale <= 1.01:
+        return bgr
+    h, w = bgr.shape[:2]
+    nw = max(2, int(round(w * scale)))
+    nh = max(2, int(round(h * scale)))
+    nw -= nw % 2
+    nh -= nh % 2
+    if nw <= w and nh <= h:
+        return bgr
+    rgb = _bgr_to_rgb(bgr)
+    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+    mask_n = _structure_mask(gray)
+    lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB)
+    l_ch, a_ch, b_ch = cv2.split(lab)
+    l_hr = _iterative_backproject_l(l_ch, nw, nh)
+    a_hr = cv2.resize(a_ch, (nw, nh), interpolation=cv2.INTER_LANCZOS4)
+    b_hr = cv2.resize(b_ch, (nw, nh), interpolation=cv2.INTER_LANCZOS4)
+    rgb_hr = cv2.cvtColor(
+        cv2.merge((np.clip(l_hr, 0, 255).astype(np.uint8), a_hr, b_hr)),
+        cv2.COLOR_LAB2RGB,
+    )
+    mask = cv2.resize(mask_n, (nw, nh), interpolation=cv2.INTER_LINEAR)
+    mask = np.clip(cv2.GaussianBlur(mask, (0, 0), 1.1) * 1.25, 0.0, 1.0)
+    out_bgr = _protect_smooth(_rgb_to_bgr(rgb_hr), mask)
+    lab = cv2.cvtColor(out_bgr, cv2.COLOR_BGR2LAB)
+    l_ch, a_ch, b_ch = cv2.split(lab)
+    sharp = _hf_unsharp_l(l_ch, sigma=0.8, amount=0.58, threshold=1.4)
+    l_ch = np.clip(
+        (1.0 - mask) * l_ch.astype(np.float32) + mask * sharp.astype(np.float32),
+        0,
+        255,
+    ).astype(np.uint8)
+    return cv2.cvtColor(cv2.merge((l_ch, a_ch, b_ch)), cv2.COLOR_LAB2BGR)
 
 
 def _deblock_compression(bgr: np.ndarray) -> np.ndarray:
@@ -393,7 +451,7 @@ def enhance_photo(
     cancel: Optional[threading.Event] = None,
     progress: Optional[ProgressFn] = None,
 ) -> np.ndarray:
-    """Punch de bar com máscara: pretos e micro-textura, pele/fundo lisos. Sem CLAHE em estúdio."""
+    """Detalhe de celular: upscale limpo se a fonte for pequena. Sem HDR no retrato."""
     if rgb.ndim != 3 or rgb.shape[2] < 3:
         raise MediaError("imagem inválida.")
     _check(cancel)
@@ -402,7 +460,7 @@ def enhance_photo(
     bgr = _rgb_to_bgr(original)
 
     plan = assess_recovery(original)
-    amount = _punch_amount(original, plan)
+    already_phone = max(original.shape[:2]) >= 1400 and not plan.upscale
 
     if plan.deblock:
         _check(cancel)
@@ -410,42 +468,28 @@ def enhance_photo(
         bgr = _deblock_compression(bgr)
     if plan.upscale:
         _check(cancel)
-        _report(progress, 16.0, "Lanczos")
-        bgr = _lanczos_upscale(bgr, plan.scale)
+        _report(progress, 18.0, "detalhe tipo celular")
+        bgr = _clean_phone_upscale(bgr, plan.scale)
 
-    _check(cancel)
-    _report(progress, 22.0, "balanço de branco")
-    bgr = _white_balance(bgr, 0.16 + 0.12 * amount)
-
-    lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB)
-    l_ch, a_ch, b_ch = cv2.split(lab)
-    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-    mask = _structure_mask(gray)
-    smooth = _smooth_fraction(gray)
-    contrast = _l_contrast(original)
-    p1 = float(np.percentile(l_ch, 1))
-
-    _check(cancel)
-    _report(progress, 40.0, "pretos e contraste")
-    if p1 > 12.0:
+    if already_phone:
+        # foto já no nível da foto 1: não piorar com curva/CLAHE
+        _report(progress, 70.0, "preservar")
+        processed = _bgr_to_rgb(bgr)
+    elif _underexposed(original):
+        _check(cancel)
+        _report(progress, 40.0, "exposição")
+        bgr = _white_balance(bgr, 0.18)
+        lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB)
+        l_ch, a_ch, b_ch = cv2.split(lab)
         l_ch = _levels_percentile(
-            l_ch, low_p=0.8, high_p=99.55, floor=5.0, ceiling=251.0
+            l_ch, low_p=1.0, high_p=99.2, floor=8.0, ceiling=248.0
         )
-    if smooth < 0.52 and contrast < 185.0 and amount >= 0.55:
-        _report(progress, 55.0, "CLAHE")
-        l_ch = _clahe_l(l_ch, mix=0.32 + 0.18 * amount, clip=1.35)
-
-    l_ch = _deepen_structured_blacks(l_ch, mask, amount)
-    l_ch = _s_curve_l(np.clip(l_ch, 0, 255).astype(np.uint8), amount=0.10 + 0.14 * amount)
-
-    _check(cancel)
-    _report(progress, 74.0, "textura")
-    l_ch = _masked_micro_contrast(l_ch, mask, amount)
-
-    a_ch, b_ch = _chroma_pop(a_ch, b_ch, 1.0 + 0.07 * amount)
-
-    processed = cv2.cvtColor(cv2.merge((l_ch, a_ch, b_ch)), cv2.COLOR_LAB2BGR)
-    processed = _bgr_to_rgb(processed)
+        processed = _bgr_to_rgb(
+            cv2.cvtColor(cv2.merge((l_ch, a_ch, b_ch)), cv2.COLOR_LAB2BGR)
+        )
+    else:
+        _report(progress, 80.0, "limpo")
+        processed = _bgr_to_rgb(bgr)
 
     intensity = float(np.clip(intensity, 0.0, 1.0))
     if intensity < 0.999 and processed.shape == original.shape:
