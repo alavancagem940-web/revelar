@@ -350,37 +350,44 @@ def _underexposed(rgb: np.ndarray) -> bool:
 
 
 def _iterative_backproject_l(
-    l_ch: np.ndarray, nw: int, nh: int, iters: int = 8
+    l_ch: np.ndarray,
+    nw: int,
+    nh: int,
+    iters: int = 3,
+    cancel: Optional[threading.Event] = None,
+    progress: Optional[ProgressFn] = None,
 ) -> np.ndarray:
-    """Reconstrói L em alta res para ficar fiel ao original quando rebaixado."""
+    """Reconstrói L em alta res. Poucas iterações — o loop antigo congelava a barra."""
     h, w = l_ch.shape[:2]
     src = l_ch.astype(np.float32)
     hr = cv2.resize(src, (nw, nh), interpolation=cv2.INTER_LANCZOS4)
-    for _ in range(iters):
+    total = max(1, iters)
+    for i in range(iters):
+        _check(cancel)
+        if progress is not None:
+            _report(progress, 28.0 + 18.0 * (i / total), "reconstruindo")
         down = cv2.resize(hr, (w, h), interpolation=cv2.INTER_AREA)
-        err_up = cv2.resize(src - down, (nw, nh), interpolation=cv2.INTER_CUBIC)
-        hr = np.clip(hr + 0.9 * err_up, 0.0, 255.0)
+        err_up = cv2.resize(src - down, (nw, nh), interpolation=cv2.INTER_LINEAR)
+        hr = np.clip(hr + 0.85 * err_up, 0.0, 255.0)
     return hr
 
 
 def _protect_smooth(bgr: np.ndarray, mask: np.ndarray) -> np.ndarray:
-    """Fundo e pele lisos; cabelo/tecido ficam com o detalhe reconstruído."""
-    bg = cv2.GaussianBlur(bgr, (0, 0), 2.2)
-    skin = cv2.bilateralFilter(bgr, 7, 14, 5)
-    m = mask.astype(np.float32)[..., None]
-    mix_bg = np.clip(1.0 - m * 4.0, 0.0, 1.0)
-    mix_st = np.clip((m - 0.22) / 0.55, 0.0, 1.0)
-    mix_skin = np.clip(1.0 - mix_bg - mix_st, 0.0, 1.0)
-    out = (
-        bg.astype(np.float32) * mix_bg
-        + skin.astype(np.float32) * mix_skin
-        + bgr.astype(np.float32) * mix_st
-    )
+    """Fundo e pele lisos (Gauss, sem bilateral lento); detalhe só na máscara."""
+    bg = cv2.GaussianBlur(bgr, (0, 0), 1.8)
+    m = cv2.GaussianBlur(mask.astype(np.float32), (0, 0), 1.0)[..., None]
+    mix = np.clip((m - 0.15) / 0.50, 0.0, 1.0)
+    out = bgr.astype(np.float32) * mix + bg.astype(np.float32) * (1.0 - mix)
     return np.clip(out, 0, 255).astype(np.uint8)
 
 
-def _clean_phone_upscale(bgr: np.ndarray, scale: float) -> np.ndarray:
-    """Upscale tipo celular: backprojection no L, chroma Lanczos, sem CLAHE."""
+def _clean_phone_upscale(
+    bgr: np.ndarray,
+    scale: float,
+    cancel: Optional[threading.Event] = None,
+    progress: Optional[ProgressFn] = None,
+) -> np.ndarray:
+    """Upscale tipo celular: backprojection curto no L, sem CLAHE/HDR."""
     if scale <= 1.01:
         return bgr
     h, w = bgr.shape[:2]
@@ -390,20 +397,26 @@ def _clean_phone_upscale(bgr: np.ndarray, scale: float) -> np.ndarray:
     nh -= nh % 2
     if nw <= w and nh <= h:
         return bgr
+    _report(progress, 20.0, "ampliando")
     rgb = _bgr_to_rgb(bgr)
     gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
     mask_n = _structure_mask(gray)
     lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB)
     l_ch, a_ch, b_ch = cv2.split(lab)
-    l_hr = _iterative_backproject_l(l_ch, nw, nh)
-    a_hr = cv2.resize(a_ch, (nw, nh), interpolation=cv2.INTER_LANCZOS4)
-    b_hr = cv2.resize(b_ch, (nw, nh), interpolation=cv2.INTER_LANCZOS4)
+    l_hr = _iterative_backproject_l(
+        l_ch, nw, nh, iters=3, cancel=cancel, progress=progress
+    )
+    _check(cancel)
+    _report(progress, 52.0, "cor")
+    a_hr = cv2.resize(a_ch, (nw, nh), interpolation=cv2.INTER_LINEAR)
+    b_hr = cv2.resize(b_ch, (nw, nh), interpolation=cv2.INTER_LINEAR)
     rgb_hr = cv2.cvtColor(
         cv2.merge((np.clip(l_hr, 0, 255).astype(np.uint8), a_hr, b_hr)),
         cv2.COLOR_LAB2RGB,
     )
     mask = cv2.resize(mask_n, (nw, nh), interpolation=cv2.INTER_LINEAR)
     mask = np.clip(cv2.GaussianBlur(mask, (0, 0), 1.1) * 1.25, 0.0, 1.0)
+    _report(progress, 62.0, "limpando")
     out_bgr = _protect_smooth(_rgb_to_bgr(rgb_hr), mask)
     lab = cv2.cvtColor(out_bgr, cv2.COLOR_BGR2LAB)
     l_ch, a_ch, b_ch = cv2.split(lab)
@@ -413,6 +426,7 @@ def _clean_phone_upscale(bgr: np.ndarray, scale: float) -> np.ndarray:
         0,
         255,
     ).astype(np.uint8)
+    _report(progress, 74.0, "nitidez")
     return cv2.cvtColor(cv2.merge((l_ch, a_ch, b_ch)), cv2.COLOR_LAB2BGR)
 
 
@@ -445,6 +459,20 @@ def _chroma_pop(a_ch: np.ndarray, b_ch: np.ndarray, factor: float = 1.07) -> tup
     return np.clip(a, 0, 255).astype(np.uint8), np.clip(b, 0, 255).astype(np.uint8)
 
 
+def quick_preview_enhance(rgb: np.ndarray) -> np.ndarray:
+    """Primeiro Depois em <1s: só o resize, sem IBP. O job completo substitui."""
+    if rgb.ndim != 3 or rgb.shape[2] < 3:
+        return rgb
+    original = np.ascontiguousarray(rgb[..., :3].astype(np.uint8))
+    plan = assess_recovery(original)
+    if not plan.upscale:
+        return original
+    h, w = original.shape[:2]
+    nw = max(2, int(round(w * plan.scale)))
+    nh = max(2, int(round(h * plan.scale)))
+    return cv2.resize(original, (nw, nh), interpolation=cv2.INTER_LINEAR)
+
+
 def enhance_photo(
     rgb: np.ndarray,
     intensity: float = 1.0,
@@ -464,12 +492,14 @@ def enhance_photo(
 
     if plan.deblock:
         _check(cancel)
-        _report(progress, 10.0, "desbloqueando")
+        _report(progress, 12.0, "desbloqueando")
         bgr = _deblock_compression(bgr)
     if plan.upscale:
         _check(cancel)
         _report(progress, 18.0, "detalhe tipo celular")
-        bgr = _clean_phone_upscale(bgr, plan.scale)
+        bgr = _clean_phone_upscale(
+            bgr, plan.scale, cancel=cancel, progress=progress
+        )
 
     if already_phone:
         # foto já no nível da foto 1: não piorar com curva/CLAHE

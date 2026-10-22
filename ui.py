@@ -13,7 +13,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 from export_ios import find_ffmpeg
 from jobs import AUTO_INTENSITY, JobController, JobRequest, UiEvent
-from photo_engine import is_photo, is_video
+from photo_engine import downscale_rgb, is_photo, is_video
 
 APP_TITLE = "Revelar"
 BG = "#121212"
@@ -49,10 +49,54 @@ class QueueItem:
 
 
 def _fit_pil(rgb: np.ndarray, max_w: int, max_h: int) -> Image.Image:
-    image = Image.fromarray(np.clip(rgb[..., :3], 0, 255).astype(np.uint8), mode="RGB")
+    arr = np.clip(rgb[..., :3], 0, 255).astype(np.uint8)
+    if max(arr.shape[:2]) > 1600:
+        arr = downscale_rgb(arr, 1600)
+    image = Image.fromarray(arr, mode="RGB")
     max_w, max_h = max(8, int(max_w)), max(8, int(max_h))
     image.thumbnail((max_w, max_h), Image.Resampling.LANCZOS)
     return image
+
+
+def _split_drop_paths(data: str) -> list[Path]:
+    """Interpreta o payload do TkDND ({path with spaces} path2)."""
+    raw = (data or "").strip()
+    if raw.startswith("file://"):
+        from urllib.parse import unquote, urlparse
+
+        parsed = urlparse(raw)
+        return [Path(unquote(parsed.path))]
+    paths: list[str] = []
+    buf = ""
+    in_brace = False
+    for ch in raw:
+        if ch == "{":
+            in_brace = True
+            buf = ""
+        elif ch == "}":
+            in_brace = False
+            if buf:
+                paths.append(buf)
+            buf = ""
+        elif ch == " " and not in_brace:
+            if buf:
+                paths.append(buf)
+            buf = ""
+        else:
+            buf += ch
+    if buf:
+        paths.append(buf)
+    out: list[Path] = []
+    for item in paths:
+        text = item.strip()
+        if text.startswith("file://"):
+            from urllib.parse import unquote, urlparse
+
+            text = unquote(urlparse(text).path)
+        path = Path(text)
+        if path.is_file():
+            out.append(path)
+    return out
 
 
 def _caption_image(width: int, height: int, text: str) -> Image.Image:
@@ -91,6 +135,7 @@ class RevelarApp(ctk.CTk):
         self._build()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.bind("<Configure>", self._on_resize)
+        self._init_dnd()
         self.after(50, self._poll)
         self.after(200, self._load_samples)
         self._set_status(self._idle_status(), 0.0)
@@ -197,7 +242,7 @@ class RevelarApp(ctk.CTk):
 
         self.preview_hint = ctk.CTkLabel(
             panel,
-            text="Abra JPG, PNG, HEIC ou MP4/MOV. O tratamento começa sozinho.",
+            text="Solte ou abra JPG, PNG, HEIC ou MP4/MOV. O tratamento começa sozinho.",
             text_color=MUTED,
             font=ctk.CTkFont(size=12),
         )
@@ -281,6 +326,23 @@ class RevelarApp(ctk.CTk):
         if not paths:
             return
         self._add_paths([Path(p) for p in paths])
+
+    def _init_dnd(self) -> None:
+        """Arrastar arquivo para a janela começa a revelar na hora."""
+        try:
+            from tkinterdnd2 import DND_FILES, TkinterDnD
+
+            self.TkdndVersion = TkinterDnD._require(self)
+            self.drop_target_register(DND_FILES)
+            self.dnd_bind("<<Drop>>", self._on_drop)
+        except Exception:
+            return
+
+    def _on_drop(self, event) -> None:
+        paths = _split_drop_paths(getattr(event, "data", "") or "")
+        if paths:
+            self._add_paths(paths)
+            self._set_status("lendo…", 8.0)
 
     def _add_paths(self, paths: list[Path], select_first: bool = True) -> None:
         added: list[QueueItem] = []
@@ -495,8 +557,8 @@ class RevelarApp(ctk.CTk):
 
         item = self._item_by_job(event)
         if event.type == "progress":
-            if item:
-                item.status = event.status or item.status
+            if item and event.status and event.status != item.status:
+                item.status = event.status
                 self._render_queue()
             label = event.status or "processando"
             if item:
@@ -512,19 +574,23 @@ class RevelarApp(ctk.CTk):
                     item.processed_rgb = event.preview_rgb
                 if item is self.selected and event.preview_rgb is not None:
                     self._show_result(event.preview_rgb, "")
+            if event.percent >= 0:
+                self._set_status(event.status or "exportando", event.percent)
             return
 
         if event.type == "queued":
             self.btn_cancel.configure(state="normal")
+            name = event.path.name if event.path else "arquivo"
+            self._set_status(f"lendo — {name}", 8.0)
             return
 
         if event.type == "done":
             result = self.jobs.take_result(event.job_id)
             if item:
-                if isinstance(result, np.ndarray):
-                    item.processed_rgb = result
-                elif event.preview_rgb is not None and item.processed_rgb is None:
+                if event.preview_rgb is not None:
                     item.processed_rgb = event.preview_rgb
+                elif isinstance(result, np.ndarray):
+                    item.processed_rgb = result
                 if event.output_path:
                     item.output_path = event.output_path
                 item.status = "pronto"

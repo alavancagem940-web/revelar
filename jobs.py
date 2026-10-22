@@ -19,7 +19,13 @@ from export_ios import (
     human_os_error,
     next_export_path,
 )
-from photo_engine import enhance_photo, is_photo, is_video, load_image
+from photo_engine import (
+    enhance_photo,
+    is_photo,
+    is_video,
+    load_image,
+    quick_preview_enhance,
+)
 from video_engine import enhance_and_export_video, enhance_frame, first_frame
 
 # Fotos: punch integral. Vídeo ainda usa este valor nos filtros leves.
@@ -83,6 +89,7 @@ class JobController:
                 job_id=request.job_id,
                 path=request.source,
                 status="na fila",
+                percent=6.0,
             )
         )
         return request.job_id
@@ -212,18 +219,45 @@ class JobController:
             rgb = job.rgb
             if rgb is None:
                 rgb = load_image(src)
+                self._progress(job, 8.0, "revelando")
+                try:
+                    quick = quick_preview_enhance(rgb)
+                    self.events.put(
+                        UiEvent(
+                            type="live_frame",
+                            job_id=job.job_id,
+                            path=src,
+                            preview_rgb=_thumb(quick),
+                            percent=18.0,
+                            status="ampliando",
+                        )
+                    )
+                except Exception:
+                    pass
                 rgb = enhance_photo(
                     rgb,
                     job.intensity,
                     cancel=self._cancel,
-                    progress=lambda p, s: self._progress(job, p * 0.7, s),
+                    progress=lambda p, s: self._progress(job, 8.0 + p * 0.70, s),
                 )
             else:
                 self._progress(job, 40.0, "exportando")
+            # Depois aparece já aqui — não espera o JPEG
+            thumb = _thumb(rgb)
+            self.events.put(
+                UiEvent(
+                    type="live_frame",
+                    job_id=job.job_id,
+                    path=src,
+                    preview_rgb=thumb,
+                    percent=82.0,
+                    status="exportando",
+                )
+            )
             folder = Path(job.output_dir or Path.home() / "Revelar")
             ext = ".png" if job.image_format == "png" else ".jpg"
             dest = next_export_path(folder, "foto", ext)
-            self._progress(job, 80.0, "exportando")
+            self._progress(job, 88.0, "exportando")
             export_photo(rgb, dest, fmt=job.image_format)
             self._store(job.job_id, rgb)
             self.events.put(
@@ -234,7 +268,7 @@ class JobController:
                     status=f"salvo: {dest.name}",
                     percent=100.0,
                     output_path=dest,
-                    preview_rgb=_thumb(rgb),
+                    preview_rgb=thumb,
                 )
             )
             return

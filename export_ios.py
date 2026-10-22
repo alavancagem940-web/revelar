@@ -81,12 +81,19 @@ def require_ffmpeg() -> str:
     return exe
 
 
+_SRGB_ICC: Optional[bytes] = None
+
+
 def srgb_icc_bytes() -> Optional[bytes]:
+    global _SRGB_ICC
+    if _SRGB_ICC is not None:
+        return _SRGB_ICC or None
     try:
         profile = ImageCms.createProfile("sRGB")
-        return ImageCms.ImageCmsProfile(profile).tobytes()
+        _SRGB_ICC = ImageCms.ImageCmsProfile(profile).tobytes()
     except Exception:
-        return None
+        _SRGB_ICC = b""
+    return _SRGB_ICC or None
 
 
 def even_size(width: int, height: int) -> tuple[int, int]:
@@ -149,14 +156,14 @@ def export_photo(
         save_kwargs["icc_profile"] = icc
     try:
         if fmt == "png":
-            image.save(dest, format="PNG", optimize=True, **save_kwargs)
+            image.save(dest, format="PNG", **save_kwargs)
         else:
+            # sem optimize/progressive: o passe extra do Pillow trava em foto grande
             image.save(
                 dest,
                 format="JPEG",
                 quality=int(quality),
-                optimize=True,
-                progressive=True,
+                subsampling=0,
                 **save_kwargs,
             )
     except OSError as exc:
